@@ -29,6 +29,14 @@ SECRET_PATTERNS = [
     ("Client-side API key assignment", re.compile(r"(?i)(?:api[_-]?key|secret|token)\s*[:=]\s*['\"]([^'\"]{16,160})['\"]")),
 ]
 
+ASSET_VERSION_PATTERNS = [
+    ("jQuery", re.compile(r"(?i)jquery(?:[-.]|%20)?v?([0-9]+(?:\.[0-9]+){1,3})(?:\.min)?\.js")),
+    ("Bootstrap", re.compile(r"(?i)bootstrap(?:[-.]|%20)?v?([0-9]+(?:\.[0-9]+){1,3})(?:\.bundle)?(?:\.min)?\.(?:js|css)")),
+    ("Vue.js", re.compile(r"(?i)vue(?:[-.]|%20)?v?([0-9]+(?:\.[0-9]+){1,3})(?:\.global|\.prod|\.min)*\.js")),
+    ("React", re.compile(r"(?i)react(?:[-.]|%20)?v?([0-9]+(?:\.[0-9]+){1,3})(?:\.production|\.min)*\.js")),
+]
+
+
 def fingerprint_technologies(headers: dict[str,str], body: str, asset_urls: list[str] | None = None) -> list[tuple[str,str]]:
     hay = "\n".join([body[:500_000], "\n".join(f"{k}:{v}" for k,v in headers.items()), "\n".join(asset_urls or [])])
     found: dict[str,str] = {}
@@ -48,6 +56,54 @@ def fingerprint_technologies(headers: dict[str,str], body: str, asset_urls: list
     if powered: found.setdefault(powered[:120], "X-Powered-By header")
     return sorted(found.items())
 
+
+def extract_asset_versions(body: str, asset_urls: list[str] | None = None) -> list[tuple[str,str,str]]:
+    results: list[tuple[str,str,str]] = []
+    seen=set()
+    generator = re.search(r"(?is)<meta[^>]+name=['\"]generator['\"][^>]+content=['\"]([^'\"]+)['\"]", body)
+    if generator:
+        value=unescape(generator.group(1)).strip()
+        m=re.match(r"(.+?)\s+([0-9]+(?:\.[0-9]+){1,3})(?:\s|$)",value)
+        if m:
+            key=(m.group(1).strip(),m.group(2),"generator")
+            if key not in seen: results.append(key); seen.add(key)
+    for url in asset_urls or []:
+        path=urlparse(url).path.rsplit("/",1)[-1]
+        for name,pattern in ASSET_VERSION_PATTERNS:
+            m=pattern.search(path)
+            if m:
+                key=(name,m.group(1),url)
+                if key not in seen: results.append(key); seen.add(key)
+    return results[:80]
+
+
+def third_party_hosts(page_url: str, asset_urls: list[str] | None = None) -> list[str]:
+    page_host=(urlparse(page_url).hostname or "").lower().rstrip(".")
+    hosts=[]
+    for asset in asset_urls or []:
+        host=(urlparse(asset).hostname or "").lower().rstrip(".")
+        if host and host!=page_host and host not in hosts: hosts.append(host)
+    return hosts[:80]
+
+
+def parse_security_txt(text: str) -> list[tuple[str,str]]:
+    allowed={"contact","expires","encryption","acknowledgments","preferred-languages","canonical","policy","hiring"}
+    out=[]
+    for raw in text.splitlines():
+        line=raw.strip()
+        if not line or line.startswith("#") or ":" not in line: continue
+        key,value=line.split(":",1); key=key.strip().lower(); value=value.strip()
+        if key in allowed and value:
+            out.append((key,value[:500]))
+        if len(out)>=40: break
+    return out
+
+
+def browser_isolation_headers(headers: dict[str,str]) -> dict[str,str]:
+    wanted=("cross-origin-opener-policy","cross-origin-embedder-policy","cross-origin-resource-policy")
+    return {k:headers[k] for k in wanted if headers.get(k)}
+
+
 def extract_js_routes(source_url: str, text: str) -> list[str]:
     out=[]
     for pattern in JS_ROUTE_PATTERNS:
@@ -59,14 +115,17 @@ def extract_js_routes(source_url: str, text: str) -> list[str]:
             if len(out)>=120: return out
     return out
 
+
 def source_map_hint(source_url: str, text: str) -> str | None:
     m=re.search(r"(?m)//[#@]\s*sourceMappingURL=([^\s]+)", text[-20_000:])
     return urljoin(source_url,m.group(1).strip()) if m else None
+
 
 def redact_secret(value: str) -> str:
     value=value.strip()
     if len(value)<=8: return "***"
     return value[:4]+"…"+value[-4:]
+
 
 def secret_indicators(text: str) -> list[tuple[str,str]]:
     results=[]
@@ -77,6 +136,7 @@ def secret_indicators(text: str) -> list[tuple[str,str]]:
         raw=m.group(1) if m.lastindex else m.group(0)
         results.append((label,redact_secret(raw)))
     return results
+
 
 def mixed_content_urls(page_url: str, body: str) -> list[str]:
     if urlparse(page_url).scheme!="https": return []
