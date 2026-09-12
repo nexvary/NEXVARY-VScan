@@ -15,7 +15,9 @@ from .asset_intelligence import compare_findings, surface_summary, technology_in
 from .config import VERSION, ADMIN_PASSWORD, SESSION_SECRET, ALLOW_PRIVATE_TEST_TARGETS
 from .db import Base, SessionLocal, db_session, engine
 from .models import AuditLog, ScanRequest, Target, User
+from .quality_intelligence import assessment_quality, remediation_queue
 from .risk_engine import risk_summary
+from .sarif_export import build_sarif
 from .scanner import safe_scan
 from .security import hash_password, is_public_host, normalize_target, verify_password
 
@@ -45,28 +47,16 @@ def require_admin(user:User=Depends(current_user)):
 def audit(db,actor,action,detail=""): db.add(AuditLog(actor=actor,action=action,detail=detail))
 
 def _previous_completed_scan(db:Session,scan:ScanRequest):
-    return db.scalar(
-        select(ScanRequest)
-        .where(
-            ScanRequest.target_id==scan.target_id,
-            ScanRequest.status=="completed",
-            ScanRequest.id < scan.id,
-        )
-        .order_by(ScanRequest.id.desc())
-        .limit(1)
-    )
+    return db.scalar(select(ScanRequest).where(ScanRequest.target_id==scan.target_id,ScanRequest.status=="completed",ScanRequest.id<scan.id).order_by(ScanRequest.id.desc()).limit(1))
 
 def _assessment_context(db:Session,scan:ScanRequest)->dict:
     order={"Critical":0,"High":1,"Medium":2,"Low":3,"Info":4}
     findings=sorted(scan.findings,key=lambda f:(order.get(f.severity,9),f.title,f.endpoint or ""))
     surfaces=sorted(scan.surface_items,key=lambda s:(s.category,s.value))
     previous=_previous_completed_scan(db,scan)
-    trend=compare_findings(findings,previous.findings) if previous else {
-        "new":[],"resolved":[],"persistent":[],"new_count":0,"resolved_count":0,"persistent_count":0
-    }
+    trend=compare_findings(findings,previous.findings) if previous else {"new":[],"resolved":[],"persistent":[],"new_count":0,"resolved_count":0,"persistent_count":0}
     return {
-        "findings":findings,
-        "surfaces":surfaces,
+        "findings":findings,"surfaces":surfaces,
         "surface_counts":Counter(s.category for s in surfaces),
         "severity_counts":Counter(f.severity for f in findings),
         "confirmed_count":sum(1 for f in findings if f.confirmed),
@@ -74,8 +64,9 @@ def _assessment_context(db:Session,scan:ScanRequest)->dict:
         "risk":risk_summary(findings),
         "asset_intelligence":surface_summary(surfaces),
         "technology_inventory":technology_inventory(surfaces),
-        "trend":trend,
-        "previous_scan":previous,
+        "trend":trend,"previous_scan":previous,
+        "quality":assessment_quality(scan,findings,surfaces),
+        "remediation_queue":remediation_queue(findings),
     }
 
 @app.exception_handler(HTTPException)
@@ -158,42 +149,30 @@ def run(scan_id:int,db:Session=Depends(db_session),user:User=Depends(require_adm
 def scan_detail(scan_id:int,request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
     scan=db.get(ScanRequest,scan_id)
     if not scan: raise HTTPException(404,"Scan not found")
-    context=_assessment_context(db,scan)
-    context.update({"request":request,"scan":scan,"user":user,"version":VERSION})
+    context=_assessment_context(db,scan); context.update({"request":request,"scan":scan,"user":user,"version":VERSION})
     return templates.TemplateResponse("scan.html",context)
 
 @app.get("/scans/{scan_id}/report",response_class=HTMLResponse)
 def report(scan_id:int,request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
     scan=db.get(ScanRequest,scan_id)
     if not scan: raise HTTPException(404,"Scan not found")
-    context=_assessment_context(db,scan)
-    context.update({"request":request,"scan":scan,"user":user,"version":VERSION})
+    context=_assessment_context(db,scan); context.update({"request":request,"scan":scan,"user":user,"version":VERSION})
     return templates.TemplateResponse("report.html",context)
 
 @app.get("/scans/{scan_id}/export.json")
 def export(scan_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
     scan=db.get(ScanRequest,scan_id)
     if not scan: raise HTTPException(404,"Scan not found")
-    context=_assessment_context(db,scan)
-    previous=context["previous_scan"]
-    payload={
-        "product":"NEXVARY VScan",
-        "version":VERSION,
-        "stage":1250,
-        "mode":"authorized-defensive",
-        "scan_id":scan.id,
-        "status":scan.status,
-        "target":{"name":scan.target.name,"url":scan.target.url,"owner":scan.target.owner,"verified":scan.target.verified},
-        "approval":{"requested_by":scan.requested_by,"approved_by":scan.approved_by,"note":scan.approval_note},
-        "metrics":{"security_score":scan.security_score,"pages_crawled":scan.pages_crawled,"requests_made":scan.requests_made,"duration_ms":scan.duration_ms},
-        "risk_intelligence":context["risk"],
-        "asset_intelligence":context["asset_intelligence"],
-        "technology_inventory":context["technology_inventory"],
-        "trend":{"baseline_scan_id":previous.id if previous else None,"baseline_score":previous.security_score if previous else None,**context["trend"]},
-        "findings":[{"severity":f.severity,"title":f.title,"category":f.category,"confidence":f.confidence,"confirmed":f.confirmed,"endpoint":f.endpoint,"detail":f.detail,"evidence":f.evidence,"remediation":f.remediation,"cwe":f.cwe,"owasp":f.owasp} for f in context["findings"]],
-        "attack_surface":[{"category":i.category,"value":i.value,"source":i.source_endpoint,"method":i.method,"detail":i.detail} for i in context["surfaces"]]
-    }
+    context=_assessment_context(db,scan); previous=context["previous_scan"]
+    payload={"product":"NEXVARY VScan","version":VERSION,"stage":1500,"mode":"authorized-defensive","scan_id":scan.id,"status":scan.status,"target":{"name":scan.target.name,"url":scan.target.url,"owner":scan.target.owner,"verified":scan.target.verified},"approval":{"requested_by":scan.requested_by,"approved_by":scan.approved_by,"note":scan.approval_note},"metrics":{"security_score":scan.security_score,"pages_crawled":scan.pages_crawled,"requests_made":scan.requests_made,"duration_ms":scan.duration_ms},"risk_intelligence":context["risk"],"quality_intelligence":context["quality"],"remediation_queue":context["remediation_queue"],"asset_intelligence":context["asset_intelligence"],"technology_inventory":context["technology_inventory"],"trend":{"baseline_scan_id":previous.id if previous else None,"baseline_score":previous.security_score if previous else None,**context["trend"]},"findings":[{"severity":f.severity,"title":f.title,"category":f.category,"confidence":f.confidence,"confirmed":f.confirmed,"endpoint":f.endpoint,"detail":f.detail,"evidence":f.evidence,"remediation":f.remediation,"cwe":f.cwe,"owasp":f.owasp} for f in context["findings"]],"attack_surface":[{"category":i.category,"value":i.value,"source":i.source_endpoint,"method":i.method,"detail":i.detail} for i in context["surfaces"]]}
     return JSONResponse(payload,headers={"Content-Disposition":f'attachment; filename="nexvary-vscan-{scan.id}.json"'})
 
+@app.get("/scans/{scan_id}/export.sarif")
+def export_sarif(scan_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
+    scan=db.get(ScanRequest,scan_id)
+    if not scan: raise HTTPException(404,"Scan not found")
+    payload=build_sarif(scan,scan.findings,VERSION)
+    return JSONResponse(payload,media_type="application/sarif+json",headers={"Content-Disposition":f'attachment; filename="nexvary-vscan-{scan.id}.sarif"'})
+
 @app.get("/health")
-def health(): return {"status":"ok","version":VERSION,"stage":1250,"mode":"authorized-defensive"}
+def health(): return {"status":"ok","version":VERSION,"stage":1500,"mode":"authorized-defensive"}
