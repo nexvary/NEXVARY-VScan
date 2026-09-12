@@ -2,7 +2,7 @@ from __future__ import annotations
 import http.cookiejar, json, os, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-ROOT=Path(__file__).resolve().parent; DB=ROOT/'smoke.db'; TOKEN=ROOT/'.smoke-token'; VERSION='0.8.5'
+ROOT=Path(__file__).resolve().parent; DB=ROOT/'smoke.db'; TOKEN=ROOT/'.smoke-token'; VERSION='1.2.5'
 def port():
     s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); return p
 class H(BaseHTTPRequestHandler):
@@ -15,7 +15,8 @@ class H(BaseHTTPRequestHandler):
         elif path=='/.well-known/security.txt': body='Contact: mailto:security@example.test'; ctype='text/plain'
         elif path=='/app.js': body='fetch("/api/v2/users"); const apiKey="1234567890abcdef1234567890abcdef";\n//# sourceMappingURL=app.js.map'; ctype='application/javascript'
         elif path=='/two': body='<html>Traceback demo</html>'; ctype='text/html'
-        else: body='<html><meta name="generator" content="NEXVARY-QA"><a href="/two?next=/home">Two</a><script src="/app.js"></script><form method="post" action="/login"><input name="email"><input type="password" name="password"></form></html>'; ctype='text/html'
+        elif path=='/admin': body='<html>Admin console</html>'; ctype='text/html'
+        else: body='<html><meta name="generator" content="NEXVARY-QA 2.4.1"><a href="/two?next=/home">Two</a><a href="/admin">Admin</a><script src="/app.js"></script><form method="post" action="/login"><input name="email"><input type="password" name="password"></form></html>'; ctype='text/html'
         self.send_response(200); self.send_header('Content-Type',ctype); self.send_header('Access-Control-Allow-Origin','*'); self.send_header('Set-Cookie','sid=abc'); self.end_headers(); self.wfile.write(body.encode())
 def post(o,u,d): return o.open(urllib.request.Request(u,data=urllib.parse.urlencode(d).encode(),method='POST'),timeout=20)
 def one(sql):
@@ -27,6 +28,8 @@ def one(sql):
         except sqlite3.Error: pass
         time.sleep(.1)
     raise RuntimeError(sql)
+def run_scan(o,base,tid):
+    post(o,base+f'/targets/{tid}/request-scan',{}).read(); sid=one('select id from scan_requests order by id desc limit 1')[0]; post(o,base+f'/admin/scans/{sid}/approve',{'note':'QA'}).read(); post(o,base+f'/admin/scans/{sid}/run',{}).read(); return sid
 def main():
     for p in (DB,TOKEN):
         try:p.unlink()
@@ -35,9 +38,24 @@ def main():
     try:
         for _ in range(80):
             try:
-                if json.loads(urllib.request.urlopen(base+'/health',timeout=1).read())['version']==VERSION: break
+                health=json.loads(urllib.request.urlopen(base+'/health',timeout=1).read())
+                if health['version']==VERSION and health['stage']==1250: break
             except: time.sleep(.25)
-        jar=http.cookiejar.CookieJar(); o=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar)); post(o,base+'/login',{'username':'admin','password':'ChangeMe123!'}).read(); post(o,base+'/targets',{'name':'QA','url':f'http://127.0.0.1:{tp}','owner':'NEXVARY'}).read(); tid,tok=one('select id,verification_token from targets order by id desc limit 1'); TOKEN.write_text(tok); post(o,base+f'/targets/{tid}/verify',{}).read(); post(o,base+f'/targets/{tid}/request-scan',{}).read(); sid=one('select id from scan_requests order by id desc limit 1')[0]; post(o,base+f'/admin/scans/{sid}/approve',{'note':'QA'}).read(); post(o,base+f'/admin/scans/{sid}/run',{}).read(); status,score,pages,reqs=one(f'select status,security_score,pages_crawled,requests_made from scan_requests where id={sid}'); findings=one(f'select count(*) from findings where scan_request_id={sid}')[0]; surface=one(f'select count(*) from surface_items where scan_request_id={sid}')[0]; apis=one(f"select count(*) from surface_items where scan_request_id={sid} and category='api'")[0]; tech=one(f"select count(*) from surface_items where scan_request_id={sid} and category='technology'")[0]; potential=one(f"select count(*) from findings where scan_request_id={sid} and confirmed=0")[0]; assert status=='completed' and pages>=2 and reqs>=5 and findings>=5 and surface>=8 and apis>=1 and tech>=1 and potential>=1; print(f'LIVE E2E PASSED score={score} pages={pages} requests={reqs} findings={findings} surface={surface} api={apis} tech={tech} potential={potential}')
+        else: raise RuntimeError('health gate failed')
+        jar=http.cookiejar.CookieJar(); o=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar)); post(o,base+'/login',{'username':'admin','password':'ChangeMe123!'}).read(); post(o,base+'/targets',{'name':'QA','url':f'http://127.0.0.1:{tp}','owner':'NEXVARY'}).read(); tid,tok=one('select id,verification_token from targets order by id desc limit 1'); TOKEN.write_text(tok); post(o,base+f'/targets/{tid}/verify',{}).read()
+        sid1=run_scan(o,base,tid)
+        status,score,pages,reqs=one(f'select status,security_score,pages_crawled,requests_made from scan_requests where id={sid1}'); findings=one(f'select count(*) from findings where scan_request_id={sid1}')[0]; surface=one(f'select count(*) from surface_items where scan_request_id={sid1}')[0]; apis=one(f"select count(*) from surface_items where scan_request_id={sid1} and category='api'")[0]; tech=one(f"select count(*) from surface_items where scan_request_id={sid1} and category='technology'")[0]; potential=one(f"select count(*) from findings where scan_request_id={sid1} and confirmed=0")[0]; assert status=='completed' and pages>=2 and reqs>=5 and findings>=5 and surface>=8 and apis>=1 and tech>=1 and potential>=1
+        sid2=run_scan(o,base,tid)
+        export=json.loads(o.open(base+f'/scans/{sid2}/export.json',timeout=20).read())
+        assert export['stage']==1250 and export['mode']=='authorized-defensive'
+        assert export['risk_intelligence']['confirmed']>=1
+        assert export['asset_intelligence']['admin_like_routes']
+        assert export['technology_inventory']
+        assert export['trend']['baseline_scan_id']==sid1 and export['trend']['persistent_count']>=1
+        report=o.open(base+f'/scans/{sid2}/report',timeout=20).read().decode()
+        detail=o.open(base+f'/scans/{sid2}',timeout=20).read().decode()
+        assert 'Stage 1250' in report and 'Assessment Intelligence' in detail and 'Asset Intelligence' in detail
+        print(f'LIVE E2E STAGE 1250 PASSED score={score} pages={pages} requests={reqs} findings={findings} surface={surface} api={apis} tech={tech} potential={potential} persistent={export["trend"]["persistent_count"]}')
     finally:
         srv.shutdown(); proc.terminate(); proc.wait(timeout=5)
         for p in (DB,TOKEN):
