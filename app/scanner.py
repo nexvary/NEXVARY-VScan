@@ -8,7 +8,11 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from .config import MAX_PAGES, MAX_REQUESTS, REQUEST_DELAY, ALLOW_PRIVATE_TEST_TARGETS, VERSION
-from .intelligence import extract_js_routes, fingerprint_technologies, mixed_content_urls, secret_indicators, source_map_hint
+from .intelligence import (
+    browser_isolation_headers, extract_asset_versions, extract_js_routes,
+    fingerprint_technologies, mixed_content_urls, parse_security_txt,
+    secret_indicators, source_map_hint, third_party_hosts,
+)
 from .models import Finding, ScanRequest, SurfaceItem
 from .security import is_public_host, same_scope
 
@@ -17,12 +21,20 @@ STATIC_EXTENSIONS=(".png",".jpg",".jpeg",".gif",".svg",".css",".woff",".woff2","
 class SurfaceParser(HTMLParser):
     def __init__(self, base_url:str):
         super().__init__(convert_charrefs=True)
-        self.base_url=base_url; self.links=[]; self.scripts=[]; self.styles=[]; self.forms=[]; self._form=None
+        self.base_url=base_url
+        self.links=[]; self.scripts=[]; self.styles=[]; self.forms=[]
+        self.script_meta=[]; self.style_meta=[]; self._form=None
     def handle_starttag(self, tag, attrs):
         d={str(k).lower():(v or "") for k,v in attrs}; tag=tag.lower()
-        if tag=="a" and d.get("href"): self.links.append(urljoin(self.base_url,d["href"]))
-        elif tag=="script" and d.get("src"): self.scripts.append(urljoin(self.base_url,d["src"]))
-        elif tag=="link" and d.get("href"): self.styles.append(urljoin(self.base_url,d["href"]))
+        if tag=="a" and d.get("href"):
+            self.links.append(urljoin(self.base_url,d["href"]))
+        elif tag=="script" and d.get("src"):
+            url=urljoin(self.base_url,d["src"]); self.scripts.append(url)
+            self.script_meta.append({"url":url,"integrity":d.get("integrity","")})
+        elif tag=="link" and d.get("href"):
+            url=urljoin(self.base_url,d["href"]); self.styles.append(url)
+            rel=d.get("rel","").lower()
+            if "stylesheet" in rel: self.style_meta.append({"url":url,"integrity":d.get("integrity","")})
         elif tag=="form":
             self._form={"action":urljoin(self.base_url,d.get("action") or self.base_url),"method":(d.get("method") or "GET").upper(),"inputs":[]}
         elif tag in {"input","select","textarea"} and self._form is not None and d.get("name"):
@@ -57,7 +69,10 @@ def _analyze_response(db:Session,scan:ScanRequest,url:str,response:httpx.Respons
         ("referrer-policy","Low","Referrer-Policy header missing","Set a suitable Referrer-Policy.","CWE-200"),
         ("permissions-policy","Info","Permissions-Policy header missing","Define an explicit Permissions-Policy for browser capabilities used by the application.","CWE-693"),
     ]
-    if scheme=="https": checks.append(("strict-transport-security","Medium","HSTS header missing","Enable HSTS after confirming HTTPS-only operation.","CWE-319"))
+    if scheme=="https":
+        checks.append(("strict-transport-security","Medium","HSTS header missing","Enable HSTS after confirming HTTPS-only operation.","CWE-319"))
+    else:
+        _add_finding(db,scan,"Medium","Plaintext HTTP transport observed","The approved target is being assessed over HTTP rather than HTTPS.","Deploy HTTPS for the application and redirect HTTP traffic to HTTPS.",url,category="Transport Security",evidence=f"HTTP {response.status_code}",cwe="CWE-319",status_code=response.status_code)
     for key,sev,title,rem,cwe in checks:
         if key not in headers: _add_finding(db,scan,sev,title,f"The response did not include {key}.",rem,url,category="HTTP Security",evidence=f"HTTP {response.status_code}",cwe=cwe,status_code=response.status_code)
     csp=headers.get("content-security-policy","")
@@ -70,15 +85,31 @@ def _analyze_response(db:Session,scan:ScanRequest,url:str,response:httpx.Respons
     if origin=="*":
         sev="Medium" if creds else "Low"
         _add_finding(db,scan,sev,"Wildcard CORS policy observed","The response advertises a wildcard Access-Control-Allow-Origin policy.","Restrict allowed origins to trusted application origins where cross-origin access is required.",url,category="CORS",evidence=f"Access-Control-Allow-Origin: *; credentials={creds}",cwe="CWE-942",status_code=response.status_code)
-    for name,detail in fingerprint_technologies(headers,body,assets or []): _add_surface(db,scan,"technology",name,url,detail=detail)
+    for name,detail in fingerprint_technologies(headers,body,assets or []):
+        _add_surface(db,scan,"technology",name,url,detail=detail)
+    for name,version,source in extract_asset_versions(body,assets or []):
+        _add_surface(db,scan,"dependency",f"{name} {version}",url,method="OBSERVED",detail=f"Passive version evidence: {source[:300]}")
+    for policy,value in browser_isolation_headers(headers).items():
+        _add_surface(db,scan,"browser-policy",f"{policy}: {value}",url,method="HEADER",detail="Browser isolation policy observed")
     for cookie in response.headers.get_list("set-cookie"):
         lower=cookie.lower()
         if scheme=="https" and "secure" not in lower: _add_finding(db,scan,"Low","Cookie missing Secure attribute","A response cookie was observed without Secure.","Add Secure to cookies transported over HTTPS.",url,category="Session",evidence=cookie[:240],cwe="CWE-614",status_code=response.status_code)
         if "httponly" not in lower: _add_finding(db,scan,"Low","Cookie missing HttpOnly attribute","A response cookie was observed without HttpOnly.","Add HttpOnly to session and authentication cookies when JavaScript access is unnecessary.",url,category="Session",evidence=cookie[:240],cwe="CWE-1004",status_code=response.status_code)
         if "samesite" not in lower: _add_finding(db,scan,"Info","Cookie missing SameSite attribute","A response cookie was observed without an explicit SameSite attribute.","Set SameSite=Lax or Strict where compatible, or SameSite=None; Secure when cross-site use is required.",url,category="Session",evidence=cookie[:240],cwe="CWE-1275",status_code=response.status_code)
-    if re.search(r"(?i)(traceback|stack trace|exception at|sql syntax|fatal error:|undefined index:)",body): _add_finding(db,scan,"Medium","Verbose error disclosure observed","The page appears to expose diagnostic error text.","Disable verbose errors in production and return generic error pages.",url,category="Information Exposure",evidence="Diagnostic error marker detected",cwe="CWE-209",status_code=response.status_code)
+    if re.search(r"(?i)(traceback|stack trace|exception at|sql syntax|fatal error:|undefined index:)",body):
+        _add_finding(db,scan,"Medium","Verbose error disclosure observed","The page appears to expose diagnostic error text.","Disable verbose errors in production and return generic error pages.",url,category="Information Exposure",evidence="Diagnostic error marker detected",cwe="CWE-209",status_code=response.status_code)
     mixed=mixed_content_urls(url,body)
     if mixed: _add_finding(db,scan,"Medium","Mixed content references observed","An HTTPS page references one or more HTTP resources.","Serve all active and passive page resources over HTTPS.",url,category="Transport Security",evidence=", ".join(mixed[:3]),cwe="CWE-319",status_code=response.status_code)
+
+def _analyze_external_assets(db:Session,scan:ScanRequest,page_url:str,parser:SurfaceParser):
+    assets=parser.scripts+parser.styles
+    for host in third_party_hosts(page_url,assets):
+        _add_surface(db,scan,"third-party-host",host,page_url,method="OBSERVED",detail="Referenced by page; external resource was not fetched")
+    page_host=(urlparse(page_url).hostname or "").lower().rstrip(".")
+    for item in parser.script_meta+parser.style_meta:
+        host=(urlparse(item["url"]).hostname or "").lower().rstrip(".")
+        if host and host!=page_host and not item.get("integrity"):
+            _add_finding(db,scan,"Info","Third-party resource without Subresource Integrity", "A third-party script or stylesheet is referenced without an integrity attribute. This is a passive posture observation.","Where practical, pin third-party static assets and add an appropriate SRI integrity hash plus compatible CORS settings.",item["url"],confirmed=False,confidence="Medium",category="Supply Chain",evidence=f"Referenced by {page_url}",cwe="CWE-353")
 
 def _analyze_form(db:Session,scan:ScanRequest,page_url:str,form:dict):
     password=any(i.get("type")=="password" for i in form["inputs"])
@@ -118,6 +149,9 @@ def _discover_standard_metadata(db:Session,scan:ScanRequest,client:httpx.Client,
                 if same_scope(candidate,host):
                     _add_surface(db,scan,"route-hint",candidate,url,method="SITEMAP")
                     if not urlparse(candidate).path.lower().endswith(STATIC_EXTENSIONS): queue.append(candidate)
+        elif category=="security-contact":
+            for field,value in parse_security_txt(text):
+                _add_surface(db,scan,"security-txt",f"{field}: {value}",url,method="METADATA",detail="security.txt field")
     return requests
 
 def calculate_score(findings):
@@ -158,6 +192,7 @@ def safe_scan(db:Session,scan:ScanRequest):
                 parser=SurfaceParser(url); parser.feed(body); assets=parser.scripts+parser.styles
             _analyze_response(db,scan,url,r,body,assets)
             if parser:
+                _analyze_external_assets(db,scan,url,parser)
                 for form in parser.forms:
                     _add_surface(db,scan,"form",form["action"],url,method=form["method"],detail=", ".join(i["name"] for i in form["inputs"])); _analyze_form(db,scan,url,form)
                     for i in form["inputs"]: _add_surface(db,scan,"parameter",i["name"],form["action"],method=form["method"],detail=i["type"])
