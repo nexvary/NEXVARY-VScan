@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 
-VERSION = "0.8.5"
+VERSION = "0.9.5"
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./nexvary_vscan.db")
 ADMIN_PASSWORD = os.getenv("NEXVARY_ADMIN_PASSWORD", "ChangeMe123!")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "local-dev-only-change-in-production")
