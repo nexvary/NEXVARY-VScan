@@ -12,7 +12,7 @@ from app.intelligence import fingerprint_technologies, extract_js_routes, source
 client=TestClient(app)
 
 def test_health():
-    r=client.get('/health'); assert r.status_code==200 and r.json()['version']=='0.8.5'
+    r=client.get('/health'); assert r.status_code==200 and r.json()['version']=='1.2.5'
 
 def test_password_hash_roundtrip():
     h=hash_password('secret'); assert verify_password('secret',h) and not verify_password('wrong',h)
