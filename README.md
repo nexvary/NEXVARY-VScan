@@ -1,20 +1,28 @@
-# NEXVARY VScan v0.5.0
+# NEXVARY VScan v0.8.5 — Stage 850
 
 Professional authorized defensive web-security assessment platform for NEXVARY clients.
 
 ## Security workflow
 
-Target creation → ownership verification → scan request → NEXVARY team approval → safe assessment → findings, attack-surface map, report and JSON export.
+Target creation → ownership verification → scan request → NEXVARY team approval → safe assessment → findings, passive intelligence, attack-surface map, report and JSON export.
 
-## v0.5.0
+## Stage 850 / v0.8.5
 
-- Modularized backend (`config`, `db`, `models`, `security`, `scanner`, `main`).
-- GitHub Actions CI on Python 3.13.
-- Live end-to-end smoke test starts a real Uvicorn server and an authorized local target.
-- Ownership verification failures now return to the dashboard with an actionable message instead of raw JSON.
-- Copy-token control and clearer verification instructions.
-- Passive/low-impact crawler, HTTP header/CORS/cookie/error-disclosure checks, forms, parameters, API references and JavaScript surface mapping.
-- Same-host scope restriction and NEXVARY approval remain mandatory.
+- Premium Security Command Center interface from v0.6.
+- Hardened same-host request policy with DNS rebinding/private-address guard before assessment requests.
+- Passive technology fingerprinting from headers, HTML metadata and observed front-end assets.
+- JavaScript intelligence for observed API routes, source-map hints and client-side exposure indicators.
+- Redacted potential-secret evidence: full candidate values are never copied into findings.
+- robots.txt, sitemap.xml and security.txt discovery inside the already verified hostname.
+- Form-risk checks for password forms using GET or plaintext HTTP.
+- Expanded HTTP security checks: HSTS (HTTPS only), CSP presence and permissive directives, framing protection, Referrer-Policy, X-Content-Type-Options, Permissions-Policy, CORS, cookie Secure/HttpOnly/SameSite and mixed content.
+- Route hints, source-map references, APIs, JavaScript assets, forms, parameters, endpoints and technologies surfaced in the assessment workspace.
+- Conservative confidence model: potential findings do not lower the Security Score until confirmed.
+- GitHub Actions CI and real Uvicorn smoke test remain mandatory before merge.
+
+## Safety invariant
+
+Ownership verification and explicit NEXVARY team approval remain mandatory. Assessment requests are same-host, rate-limited and capped. This release does **not** perform SQL injection, XSS exploitation, command execution, credential guessing, destructive fuzzing or state-changing attack payloads.
 
 ## Run locally
 
@@ -37,4 +45,4 @@ pytest -q
 python smoke_test.py
 ```
 
-This release is deliberately non-destructive. It does not submit SQL injection, XSS, command-execution, credential-guessing or state-changing payloads.
+For milestone details see `docs/STAGE_850.md`.
