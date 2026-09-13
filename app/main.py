@@ -12,18 +12,31 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from .asset_intelligence import compare_findings, surface_summary, technology_inventory
-from .config import VERSION, ADMIN_PASSWORD, SESSION_SECRET, ALLOW_PRIVATE_TEST_TARGETS
+from .config import (
+    VERSION, ADMIN_PASSWORD, SESSION_SECRET, ALLOW_PRIVATE_TEST_TARGETS,
+    PRODUCTION_MODE, SECURE_COOKIES,
+)
 from .db import Base, SessionLocal, db_session, engine
 from .models import AuditLog, ScanRequest, Target, User
+from .portfolio_intelligence import portfolio_summary, score_band
 from .quality_intelligence import assessment_quality, remediation_queue
+from .release_guard import assert_production_ready, release_guard
 from .risk_engine import risk_summary
 from .sarif_export import build_sarif
 from .scanner import safe_scan
 from .security import hash_password, is_public_host, normalize_target, verify_password
 
 Base.metadata.create_all(engine)
+RELEASE_STATUS = release_guard(
+    production_mode=PRODUCTION_MODE,
+    admin_password=ADMIN_PASSWORD,
+    session_secret=SESSION_SECRET,
+    secure_cookies=SECURE_COOKIES,
+)
+assert_production_ready(RELEASE_STATUS)
+
 app=FastAPI(title="NEXVARY VScan",version=VERSION)
-app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,https_only=False,same_site="lax")
+app.add_middleware(SessionMiddleware,secret_key=SESSION_SECRET,https_only=SECURE_COOKIES,same_site="lax")
 app.mount("/static",StaticFiles(directory="app/static"),name="static")
 templates=Jinja2Templates(directory="app/templates")
 
@@ -69,6 +82,15 @@ def _assessment_context(db:Session,scan:ScanRequest)->dict:
         "remediation_queue":remediation_queue(findings),
     }
 
+def _portfolio_context(db:Session):
+    targets=db.scalars(select(Target).order_by(Target.created_at.desc())).all()
+    scans=db.scalars(select(ScanRequest).order_by(ScanRequest.created_at.desc())).all()
+    latest_by_target={}
+    for scan in scans:
+        if scan.status=="completed" and scan.target_id not in latest_by_target:
+            latest_by_target[scan.target_id]=scan
+    return targets,scans,portfolio_summary(targets,scans),latest_by_target
+
 @app.exception_handler(HTTPException)
 async def http_error(request:Request,exc:HTTPException):
     if exc.status_code==401 and request.url.path not in {"/login","/health"}: return RedirectResponse("/login",303)
@@ -90,29 +112,61 @@ def logout(request:Request): request.session.clear(); return RedirectResponse("/
 
 @app.get("/",response_class=HTMLResponse)
 def dashboard(request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
-    targets=db.scalars(select(Target).order_by(Target.created_at.desc())).all(); scans=db.scalars(select(ScanRequest).order_by(ScanRequest.created_at.desc())).all(); counts={k:0 for k in ["pending","approved","running","completed","rejected"]}
+    targets,scans,portfolio,latest_by_target=_portfolio_context(db)
+    counts={k:0 for k in ["pending","approved","running","completed","rejected"]}
     for s in scans: counts[s.status]=counts.get(s.status,0)+1
-    return templates.TemplateResponse("dashboard.html",{"request":request,"targets":targets,"scans":scans,"counts":counts,"user":user,"version":VERSION,"notice":request.query_params.get("notice"),"error":request.query_params.get("error")})
+    return templates.TemplateResponse("dashboard.html",{
+        "request":request,"targets":targets,"scans":scans,"counts":counts,
+        "portfolio":portfolio,"portfolio_band":score_band(portfolio["current_portfolio_score"]),
+        "latest_by_target":latest_by_target,"release_status":RELEASE_STATUS,
+        "user":user,"version":VERSION,"notice":request.query_params.get("notice"),"error":request.query_params.get("error")
+    })
+
+@app.get("/targets",response_class=HTMLResponse)
+def targets_page(request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
+    targets,scans,portfolio,latest_by_target=_portfolio_context(db)
+    return templates.TemplateResponse("targets.html",{"request":request,"targets":targets,"portfolio":portfolio,"latest_by_target":latest_by_target,"user":user,"version":VERSION})
+
+@app.get("/scan-center",response_class=HTMLResponse)
+def scan_center(request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
+    scans=db.scalars(select(ScanRequest).order_by(ScanRequest.created_at.desc())).all()
+    counts={k:0 for k in ["pending","approved","running","completed","rejected"]}
+    for s in scans: counts[s.status]=counts.get(s.status,0)+1
+    return templates.TemplateResponse("scan_center.html",{"request":request,"scans":scans,"counts":counts,"user":user,"version":VERSION})
+
+@app.get("/reports",response_class=HTMLResponse)
+def reports_page(request:Request,db:Session=Depends(db_session),user:User=Depends(current_user)):
+    scans=db.scalars(select(ScanRequest).where(ScanRequest.status=="completed").order_by(ScanRequest.created_at.desc())).all()
+    return templates.TemplateResponse("reports.html",{"request":request,"scans":scans,"user":user,"version":VERSION})
+
+@app.get("/portfolio.json")
+def portfolio_export(db:Session=Depends(db_session),user:User=Depends(current_user)):
+    targets,scans,portfolio,latest_by_target=_portfolio_context(db)
+    assets=[]
+    for target in targets:
+        latest=latest_by_target.get(target.id)
+        assets.append({"id":target.id,"name":target.name,"url":target.url,"owner":target.owner,"verified":target.verified,"latest_scan_id":latest.id if latest else None,"latest_score":latest.security_score if latest else None})
+    return JSONResponse({"product":"NEXVARY VScan","version":VERSION,"stage":1750,"portfolio":portfolio,"assets":assets})
 
 @app.post("/targets")
 def create_target(name:str=Form(...),url:str=Form(...),owner:str=Form(...),db:Session=Depends(db_session),user:User=Depends(current_user)):
     try: normalized=normalize_target(url)
     except ValueError as exc: raise HTTPException(400,str(exc))
-    target=Target(name=name.strip(),url=normalized,owner=owner.strip()); db.add(target); audit(db,user.username,"target.created",normalized); db.commit(); return RedirectResponse("/",303)
+    target=Target(name=name.strip(),url=normalized,owner=owner.strip()); db.add(target); audit(db,user.username,"target.created",normalized); db.commit(); return RedirectResponse("/targets",303)
 
 @app.post("/targets/{target_id}/verify")
 def verify_target(target_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
     target=db.get(Target,target_id)
     if not target: raise HTTPException(404,"Target not found")
     verification_url=target.url+"/.well-known/nexvary-verification.txt"; host=urlparse(target.url).hostname or ""
-    if not (ALLOW_PRIVATE_TEST_TARGETS or is_public_host(host)): return RedirectResponse(f"/?error={quote('Verification host is not publicly routable.')}",303)
+    if not (ALLOW_PRIVATE_TEST_TARGETS or is_public_host(host)): return RedirectResponse(f"/targets?error={quote('Verification host is not publicly routable.')}",303)
     ok=False
     try:
         with httpx.Client(timeout=8,follow_redirects=False,headers={"User-Agent":f"NEXVARY-VScan/{VERSION} Ownership-Verification"}) as client: r=client.get(verification_url)
         ok=r.status_code==200 and hmac.compare_digest(r.text.strip(),target.verification_token)
     except Exception: pass
-    if not ok: return RedirectResponse(f"/?error={quote('Ownership verification failed. Publish the exact token at '+verification_url+' and try again.')}",303)
-    target.verified=True; target.verified_at=datetime.utcnow(); audit(db,user.username,"target.verified",target.url); db.commit(); return RedirectResponse(f"/?notice={quote('Ownership verified successfully. You can now request a NEXVARY-approved scan.')}",303)
+    if not ok: return RedirectResponse(f"/targets?error={quote('Ownership verification failed. Publish the exact token at '+verification_url+' and try again.')}",303)
+    target.verified=True; target.verified_at=datetime.utcnow(); audit(db,user.username,"target.verified",target.url); db.commit(); return RedirectResponse(f"/targets?notice={quote('Ownership verified successfully.')}",303)
 
 @app.post("/targets/{target_id}/request-scan")
 def request_scan(target_id:int,db:Session=Depends(db_session),user:User=Depends(current_user)):
@@ -164,7 +218,7 @@ def export(scan_id:int,db:Session=Depends(db_session),user:User=Depends(current_
     scan=db.get(ScanRequest,scan_id)
     if not scan: raise HTTPException(404,"Scan not found")
     context=_assessment_context(db,scan); previous=context["previous_scan"]
-    payload={"product":"NEXVARY VScan","version":VERSION,"stage":1500,"mode":"authorized-defensive","scan_id":scan.id,"status":scan.status,"target":{"name":scan.target.name,"url":scan.target.url,"owner":scan.target.owner,"verified":scan.target.verified},"approval":{"requested_by":scan.requested_by,"approved_by":scan.approved_by,"note":scan.approval_note},"metrics":{"security_score":scan.security_score,"pages_crawled":scan.pages_crawled,"requests_made":scan.requests_made,"duration_ms":scan.duration_ms},"risk_intelligence":context["risk"],"quality_intelligence":context["quality"],"remediation_queue":context["remediation_queue"],"asset_intelligence":context["asset_intelligence"],"technology_inventory":context["technology_inventory"],"trend":{"baseline_scan_id":previous.id if previous else None,"baseline_score":previous.security_score if previous else None,**context["trend"]},"findings":[{"severity":f.severity,"title":f.title,"category":f.category,"confidence":f.confidence,"confirmed":f.confirmed,"endpoint":f.endpoint,"detail":f.detail,"evidence":f.evidence,"remediation":f.remediation,"cwe":f.cwe,"owasp":f.owasp} for f in context["findings"]],"attack_surface":[{"category":i.category,"value":i.value,"source":i.source_endpoint,"method":i.method,"detail":i.detail} for i in context["surfaces"]]}
+    payload={"product":"NEXVARY VScan","version":VERSION,"stage":1750,"mode":"authorized-defensive","scan_id":scan.id,"status":scan.status,"target":{"name":scan.target.name,"url":scan.target.url,"owner":scan.target.owner,"verified":scan.target.verified},"approval":{"requested_by":scan.requested_by,"approved_by":scan.approved_by,"note":scan.approval_note},"metrics":{"security_score":scan.security_score,"pages_crawled":scan.pages_crawled,"requests_made":scan.requests_made,"duration_ms":scan.duration_ms},"risk_intelligence":context["risk"],"quality_intelligence":context["quality"],"remediation_queue":context["remediation_queue"],"asset_intelligence":context["asset_intelligence"],"technology_inventory":context["technology_inventory"],"trend":{"baseline_scan_id":previous.id if previous else None,"baseline_score":previous.security_score if previous else None,**context["trend"]},"findings":[{"severity":f.severity,"title":f.title,"category":f.category,"confidence":f.confidence,"confirmed":f.confirmed,"endpoint":f.endpoint,"detail":f.detail,"evidence":f.evidence,"remediation":f.remediation,"cwe":f.cwe,"owasp":f.owasp} for f in context["findings"]],"attack_surface":[{"category":i.category,"value":i.value,"source":i.source_endpoint,"method":i.method,"detail":i.detail} for i in context["surfaces"]]}
     return JSONResponse(payload,headers={"Content-Disposition":f'attachment; filename="nexvary-vscan-{scan.id}.json"'})
 
 @app.get("/scans/{scan_id}/export.sarif")
@@ -175,4 +229,5 @@ def export_sarif(scan_id:int,db:Session=Depends(db_session),user:User=Depends(cu
     return JSONResponse(payload,media_type="application/sarif+json",headers={"Content-Disposition":f'attachment; filename="nexvary-vscan-{scan.id}.sarif"'})
 
 @app.get("/health")
-def health(): return {"status":"ok","version":VERSION,"stage":1500,"mode":"authorized-defensive"}
+def health():
+    return {"status":"ok","version":VERSION,"stage":1750,"mode":"authorized-defensive","release_ready":RELEASE_STATUS["ready"],"release_status":RELEASE_STATUS["status"]}
