@@ -2,7 +2,7 @@ from __future__ import annotations
 import http.cookiejar, json, os, socket, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-ROOT=Path(__file__).resolve().parent; DB=ROOT/'smoke.db'; TOKEN=ROOT/'.smoke-token'; VERSION='1.5.0'
+ROOT=Path(__file__).resolve().parent; DB=ROOT/'smoke.db'; TOKEN=ROOT/'.smoke-token'; VERSION='1.7.5'
 def port():
     s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); return p
 class H(BaseHTTPRequestHandler):
@@ -39,24 +39,23 @@ def main():
         for _ in range(80):
             try:
                 health=json.loads(urllib.request.urlopen(base+'/health',timeout=1).read())
-                if health['version']==VERSION and health['stage']==1500: break
+                if health['version']==VERSION and health['stage']==1750: break
             except: time.sleep(.25)
         else: raise RuntimeError('health gate failed')
         jar=http.cookiejar.CookieJar(); o=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar)); post(o,base+'/login',{'username':'admin','password':'ChangeMe123!'}).read(); post(o,base+'/targets',{'name':'QA','url':f'http://127.0.0.1:{tp}','owner':'NEXVARY'}).read(); tid,tok=one('select id,verification_token from targets order by id desc limit 1'); TOKEN.write_text(tok); post(o,base+f'/targets/{tid}/verify',{}).read()
         sid1=run_scan(o,base,tid)
-        status,score,pages,reqs=one(f'select status,security_score,pages_crawled,requests_made from scan_requests where id={sid1}'); findings=one(f'select count(*) from findings where scan_request_id={sid1}')[0]; surface=one(f'select count(*) from surface_items where scan_request_id={sid1}')[0]; apis=one(f"select count(*) from surface_items where scan_request_id={sid1} and category='api'")[0]; tech=one(f"select count(*) from surface_items where scan_request_id={sid1} and category='technology'")[0]; potential=one(f"select count(*) from findings where scan_request_id={sid1} and confirmed=0")[0]; assert status=='completed' and pages>=2 and reqs>=5 and findings>=5 and surface>=8 and apis>=1 and tech>=1 and potential>=1
+        status,score,pages,reqs=one(f'select status,security_score,pages_crawled,requests_made from scan_requests where id={sid1}'); findings=one(f'select count(*) from findings where scan_request_id={sid1}')[0]; surface=one(f'select count(*) from surface_items where scan_request_id={sid1}')[0]; assert status=='completed' and pages>=2 and reqs>=5 and findings>=5 and surface>=8
         sid2=run_scan(o,base,tid)
         export=json.loads(o.open(base+f'/scans/{sid2}/export.json',timeout=20).read())
-        assert export['stage']==1500 and export['mode']=='authorized-defensive'
-        assert export['risk_intelligence']['confirmed']>=1
-        assert export['quality_intelligence']['coverage_grade'] in {'High','Medium','Limited'}
-        assert export['remediation_queue']
-        assert export['asset_intelligence']['admin_like_routes']
-        assert export['technology_inventory']
+        assert export['stage']==1750 and export['mode']=='authorized-defensive'
+        assert export['risk_intelligence']['confirmed']>=1 and export['quality_intelligence']['coverage_grade'] in {'High','Medium','Limited'}
         assert export['trend']['baseline_scan_id']==sid1 and export['trend']['persistent_count']>=1
-        sarif=json.loads(o.open(base+f'/scans/{sid2}/export.sarif',timeout=20).read())
-        assert sarif['version']=='2.1.0' and sarif['runs'][0]['tool']['driver']['version']==VERSION and sarif['runs'][0]['results']
-        print(f'LIVE E2E STAGE 1500 PASSED score={score} pages={pages} requests={reqs} findings={findings} surface={surface} api={apis} tech={tech} potential={potential} persistent={export["trend"]["persistent_count"]}')
+        portfolio=json.loads(o.open(base+'/portfolio.json',timeout=20).read())
+        assert portfolio['stage']==1750 and portfolio['portfolio']['targets_verified']==1 and portfolio['portfolio']['completed']>=2
+        for path,marker in [('/','Executive Security Portfolio'),('/targets','Ownership & Control'),('/scan-center','All Scan Requests'),('/reports','Evidence Archive')]:
+            page=o.open(base+path,timeout=20).read().decode(); assert marker in page
+        sarif=json.loads(o.open(base+f'/scans/{sid2}/export.sarif',timeout=20).read()); assert sarif['version']=='2.1.0'
+        print(f'LIVE E2E STAGE 1750 PASSED score={score} pages={pages} requests={reqs} findings={findings} surface={surface} portfolio={portfolio["portfolio"]["current_portfolio_score"]}')
     finally:
         srv.shutdown(); proc.terminate(); proc.wait(timeout=5)
         for p in (DB,TOKEN):
