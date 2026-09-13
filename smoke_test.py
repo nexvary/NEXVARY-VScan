@@ -52,7 +52,7 @@ def main():
         assert export['trend']['baseline_scan_id']==sid1 and export['trend']['persistent_count']>=1
         portfolio=json.loads(o.open(base+'/portfolio.json',timeout=20).read())
         assert portfolio['stage']==1750 and portfolio['portfolio']['targets_verified']==1 and portfolio['portfolio']['completed']>=2
-        for path,marker in [('/','Executive Security Portfolio'),('/targets','Ownership & Control'),('/scan-center','All Scan Requests'),('/reports','Evidence Archive')]:
+        for path,marker in [('/','Security Operations Center'),('/targets','Ownership & Control'),('/scan-center','All Scan Requests'),('/reports','Evidence Archive')]:
             page=o.open(base+path,timeout=20).read().decode(); assert marker in page
         sarif=json.loads(o.open(base+f'/scans/{sid2}/export.sarif',timeout=20).read()); assert sarif['version']=='2.1.0'
         print(f'LIVE E2E STAGE 1750 PASSED score={score} pages={pages} requests={reqs} findings={findings} surface={surface} portfolio={portfolio["portfolio"]["current_portfolio_score"]}')
