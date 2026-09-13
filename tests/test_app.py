@@ -31,10 +31,19 @@ def test_dedicated_workspaces_require_authentication():
 def test_dedicated_workspaces_render_after_login():
     with TestClient(app) as c:
         c.post('/login',data={'username':'admin','password':'ChangeMe123!'})
-        expected={'/targets':'Targets','/scan-center':'Scan Center','/reports':'Reports','/':'Executive Security Portfolio'}
+        expected={'/targets':'Targets','/scan-center':'Scan Center','/reports':'Reports','/':'Security Operations Center'}
         for path,text in expected.items():
             r=c.get(path); assert r.status_code==200 and text in r.text
         p=c.get('/portfolio.json'); assert p.status_code==200 and p.json()['stage']==1750
+
+def test_reference_dashboard_layout_is_loaded():
+    with TestClient(app) as c:
+        c.post('/login',data={'username':'admin','password':'ChangeMe123!'})
+        r=c.get('/')
+        assert 'reference-dashboard.css' in r.text
+        for marker in ['kpi-grid','analytics-grid','tables-grid','action-grid','DEFENSIVE MODE','Portfolio Score']:
+            assert marker in r.text
+        assert 'hero-state' not in r.text
 
 def test_target_normalization_and_scope():
     assert normalize_target('example.com')=='https://example.com'; assert same_scope('https://example.com/a','example.com'); assert not same_scope('https://sub.example.com/a','example.com')
