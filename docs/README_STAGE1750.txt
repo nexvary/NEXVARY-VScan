@@ -1,0 +1,1 @@
+NEXVARY VScan Stage 1750 integration checkpoint: portfolio dashboard, dedicated workspaces, production release guard, portfolio export, regression and live E2E coverage.

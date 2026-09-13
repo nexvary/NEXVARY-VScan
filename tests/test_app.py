@@ -12,7 +12,7 @@ from app.intelligence import fingerprint_technologies, extract_js_routes, source
 client=TestClient(app)
 
 def test_health():
-    r=client.get('/health'); assert r.status_code==200 and r.json()['version']=='1.5.0' and r.json()['stage']==1500
+    r=client.get('/health'); data=r.json(); assert r.status_code==200 and data['version']=='1.7.5' and data['stage']==1750 and data['mode']=='authorized-defensive'
 
 def test_password_hash_roundtrip():
     h=hash_password('secret'); assert verify_password('secret',h) and not verify_password('wrong',h)
@@ -22,6 +22,19 @@ def test_dashboard_requires_login():
 
 def test_admin_login():
     r=client.post('/login',data={'username':'admin','password':'ChangeMe123!'},follow_redirects=False); assert r.status_code==303
+
+def test_dedicated_workspaces_require_authentication():
+    with TestClient(app) as c:
+        for path in ['/targets','/scan-center','/reports','/portfolio.json']:
+            r=c.get(path,follow_redirects=False); assert r.status_code==303 and r.headers['location']=='/login'
+
+def test_dedicated_workspaces_render_after_login():
+    with TestClient(app) as c:
+        c.post('/login',data={'username':'admin','password':'ChangeMe123!'})
+        expected={'/targets':'Targets','/scan-center':'Scan Center','/reports':'Reports','/':'Executive Security Portfolio'}
+        for path,text in expected.items():
+            r=c.get(path); assert r.status_code==200 and text in r.text
+        p=c.get('/portfolio.json'); assert p.status_code==200 and p.json()['stage']==1750
 
 def test_target_normalization_and_scope():
     assert normalize_target('example.com')=='https://example.com'; assert same_scope('https://example.com/a','example.com'); assert not same_scope('https://sub.example.com/a','example.com')
