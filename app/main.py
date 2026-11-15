@@ -96,6 +96,14 @@ async def http_error(request:Request,exc:HTTPException):
     if exc.status_code==401 and request.url.path not in {"/login","/health"}: return RedirectResponse("/login",303)
     return JSONResponse({"detail":exc.detail},status_code=exc.status_code)
 
+@app.get("/about-system",response_class=HTMLResponse)
+def about_system(request:Request,user:User=Depends(current_user)):
+    return templates.TemplateResponse("about_system.html",{"request":request,"user":user,"version":VERSION})
+
+@app.get("/about-developer",response_class=HTMLResponse)
+def about_developer(request:Request,user:User=Depends(current_user)):
+    return templates.TemplateResponse("about_developer.html",{"request":request,"user":user,"version":VERSION})
+
 @app.get("/login",response_class=HTMLResponse)
 def login_page(request:Request):
     if request.session.get("user_id"): return RedirectResponse("/",303)
